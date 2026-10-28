@@ -1,8 +1,8 @@
 # Async Human Approval Gate — Design
 
-Status: Draft for review  
+Status: Implemented (V1)  
 Scope: V1  
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 ## Contents
 
