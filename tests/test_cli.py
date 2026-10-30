@@ -27,10 +27,17 @@ class CliEnv:
     gate: ApprovalGate
     store: SqliteStore
 
-    def run(self, *arguments: str) -> int:
+    def run(
+        self,
+        *arguments: str,
+        input_fn=None,
+        tty: bool | None = None,
+    ) -> int:
         return main(
             ["--db", str(self.db), *arguments],
             clock=self.clock,
+            input_fn=input_fn,
+            tty=tty,
         )
 
     def propose(
@@ -39,11 +46,12 @@ class CliEnv:
         workflow_id: str = "wf_1",
         ttl: timedelta = timedelta(seconds=60),
         action: dict[str, Any] | None = None,
+        summary: str = "Send the customer email",
     ) -> Request:
         return self.gate.propose(
             workflow_id=workflow_id,
             action=action or {"tool": "send_email", "to": "a@b.c"},
-            summary="Send the customer email",
+            summary=summary,
             requested_by="agent:planner",
             ttl=ttl,
         ).request
@@ -583,3 +591,275 @@ def test_missing_request_decisions_exit_2(
         == 2
     )
     assert "does not exist" in capsys.readouterr().err.lower()
+
+
+def _answers(*values: str):
+    iterator = iter(values)
+    return lambda _prompt: next(iterator)
+
+
+def test_review_approves_without_typing_id_or_digest(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+
+    assert (
+        cli.run(
+            "review",
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("1", "a", "y"),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "Pending approvals" in output
+    assert "Send the customer email" in output
+    assert "Payload fingerprint:" in output
+    assert f"approved {request.id}" in output
+    assert "alice@corp" in output
+
+    stored = cli.gate.get(request.id)
+    assert stored is not None
+    assert stored.status is Status.APPROVED
+    transition = cli.store.get_transition(request.id)
+    assert transition is not None
+    assert transition.actor == "alice@corp"
+
+
+def test_review_accepts_a_direct_request_id(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+
+    assert (
+        cli.run(
+            "review",
+            request.id,
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("a", "y"),
+            tty=True,
+        )
+        == 0
+    )
+
+    assert cli.gate.get(request.id).status is Status.APPROVED
+    assert "Approval #1" in capsys.readouterr().out
+
+
+def test_review_rejects_with_a_reason(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+
+    assert (
+        cli.run(
+            "review",
+            "--responder",
+            "bob@corp",
+            input_fn=_answers("1", "r", "", "copy is wrong", "y"),
+            tty=True,
+        )
+        == 0
+    )
+
+    outcome = cli.gate.outcome(request.id)
+    assert outcome is not None
+    assert outcome.status is Status.REJECTED
+    assert outcome.actor == "bob@corp"
+    assert outcome.reason == "copy is wrong"
+    assert "rejected" in capsys.readouterr().out
+
+
+def test_review_skip_leaves_the_request_pending(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+
+    assert (
+        cli.run(
+            "review",
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("1", "s"),
+            tty=True,
+        )
+        == 0
+    )
+
+    assert cli.gate.get(request.id).status is Status.PENDING
+    assert "still pending" in capsys.readouterr().out
+
+
+def test_review_no_pending_requests(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        cli.run(
+            "review",
+            "--responder",
+            "alice@corp",
+            input_fn=_answers(),
+            tty=True,
+        )
+        == 0
+    )
+    assert "no pending requests" in capsys.readouterr().out
+
+
+def test_review_requires_a_terminal(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        cli.run(
+            "review",
+            "--responder",
+            "alice@corp",
+            tty=False,
+        )
+        == 6
+    )
+    assert "interactive terminal" in capsys.readouterr().err
+
+
+def test_review_direct_id_sweeps_and_shows_expiry(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose(ttl=timedelta(seconds=1))
+    cli.clock.advance_ms(1_000)
+
+    assert (
+        cli.run(
+            "review",
+            request.id,
+            "--responder",
+            "alice@corp",
+            input_fn=_answers(),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "status: expired" in output
+    assert "system:expiry" in output
+    assert "will not execute" in output
+    assert cli.gate.get(request.id).status is Status.EXPIRED
+
+
+def test_review_details_show_the_full_digest_on_demand(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+
+    assert (
+        cli.run(
+            "review",
+            request.id,
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("?", "q"),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert f"action_digest: {request.action_digest}" in output
+    assert '"tool":"send_email"' in output
+    assert cli.gate.get(request.id).status is Status.PENDING
+
+
+def test_review_escapes_terminal_control_characters(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose(
+        summary="danger\x1b[31m",
+        action={"to": "a\x1b[31mb", "tool": "send_email"},
+    )
+
+    assert (
+        cli.run(
+            "review",
+            request.id,
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("q"),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "\\x1b" in output
+
+
+def test_review_already_decided_shows_the_receipt(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = cli.propose()
+    cli.gate.approve(
+        request.id,
+        responder="alice@corp",
+        expected_digest=request.action_digest,
+        idempotency_key="already",
+    )
+
+    assert (
+        cli.run(
+            "review",
+            request.id,
+            "--responder",
+            "bob@corp",
+            input_fn=_answers(),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "status: approved" in output
+    assert "alice@corp" in output
+    assert "will not execute" not in output
+
+
+def test_review_list_sweeps_overdue_and_filters_workflow(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    overdue = cli.propose(workflow_id="wf_a", ttl=timedelta(seconds=1))
+    pending = cli.propose(workflow_id="wf_b")
+    cli.clock.advance_ms(1_000)
+
+    assert (
+        cli.run(
+            "review",
+            "--workflow",
+            "wf_b",
+            "--responder",
+            "alice@corp",
+            input_fn=_answers("q"),
+            tty=True,
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "swept 1 overdue request(s)" in output
+    assert pending.id not in output
+    assert "wf_b" in output
+    assert cli.gate.get(overdue.id).status is Status.EXPIRED

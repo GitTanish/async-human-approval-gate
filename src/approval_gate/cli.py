@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
 from .clock import (
@@ -29,8 +29,18 @@ from .errors import (
     StoreBusy,
 )
 from .gate import ApprovalGate
-from .models import Request
+from .models import Outcome, Request, Status
 from .payload import thaw_json
+from .presentation import (
+    action_rows,
+    canonical_json_text,
+    digest_fingerprint,
+    format_remaining,
+    format_utc,
+    one_line,
+    safe_terminal,
+    short_reference,
+)
 from .stores.sqlite import SqliteStore
 
 __all__ = ["main", "build_parser"]
@@ -85,6 +95,28 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show one request with a pure read. No expiry is written.",
     )
     show_parser.add_argument("request_id")
+
+    review_parser = subparsers.add_parser(
+        "review",
+        help="review pending requests and decide interactively",
+        description=(
+            "Open a human-readable approval card and decide with a few "
+            "keystrokes. The request ID and payload digest are handled for "
+            "you; use approve/reject for non-interactive automation."
+        ),
+    )
+    review_parser.add_argument(
+        "request_id",
+        nargs="?",
+        help="request to review; omit to choose from pending requests",
+    )
+    review_parser.add_argument(
+        "--responder",
+        required=True,
+        help="identity recorded for an approve or reject decision",
+    )
+    review_parser.add_argument("--workflow", help="filter the pending list")
+    review_parser.add_argument("--limit", type=int, default=100)
 
     approve_parser = subparsers.add_parser(
         "approve",
@@ -149,6 +181,8 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     clock: Clock | None = None,
+    input_fn: Callable[[str], str] | None = None,
+    tty: bool | None = None,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -157,7 +191,8 @@ def main(
         print("error: reject requires a non-empty --reason", file=sys.stderr)
         return _EXIT_INVALID
 
-    gate = _build_gate(arguments.db, clock=clock)
+    resolved_clock = clock or SystemClock()
+    gate = _build_gate(arguments.db, clock=resolved_clock)
 
     if arguments.command == "list":
         return _list(gate, arguments.workflow, arguments.limit)
@@ -166,6 +201,15 @@ def main(
     if arguments.command == "sweep":
         print(f"swept {gate.sweep()}")
         return _EXIT_OK
+    if arguments.command == "review":
+        interactive = input_fn is not None if tty is None else tty
+        return _review(
+            gate,
+            arguments,
+            clock=resolved_clock,
+            input_fn=input_fn or input,
+            interactive=interactive,
+        )
     if arguments.command == "approve":
         return _decide(
             parser,
@@ -257,6 +301,329 @@ def _show(gate: ApprovalGate, request_id: str) -> int:
         print(f"  reason: {outcome.reason}")
         print(f"  at: {_iso_time(outcome.at_ms)}")
     return _EXIT_OK
+
+
+class _ReviewCancelled(Exception):
+    """The human closed the prompt or pressed Ctrl-C."""
+
+
+def _review(
+    gate: ApprovalGate,
+    arguments: argparse.Namespace,
+    *,
+    clock: Clock,
+    input_fn: Callable[[str], str],
+    interactive: bool,
+) -> int:
+    if not interactive:
+        print(
+            "error: review needs an interactive terminal; use "
+            "list/show/approve/reject for automation",
+            file=sys.stderr,
+        )
+        return _EXIT_INVALID
+
+    try:
+        request = _select_request(gate, arguments, input_fn)
+        if request is None:
+            return _EXIT_OK
+        return _review_request(
+            gate,
+            request,
+            clock,
+            input_fn,
+            responder=arguments.responder,
+        )
+    except _ReviewCancelled:
+        print("review cancelled")
+        return _EXIT_OK
+    except ApprovalError as exc:
+        return _report_error(exc)
+
+
+def _select_request(
+    gate: ApprovalGate,
+    arguments: argparse.Namespace,
+    input_fn: Callable[[str], str],
+) -> Request | None:
+    request_id = arguments.request_id
+    if request_id is not None:
+        request = gate.get(request_id)
+        if request is None:
+            raise RequestNotFound(f"request {request_id!r} does not exist")
+        if request.overdue:
+            gate.sweep(request_id=request_id)
+            request = gate.get(request_id)
+            if request is None:
+                raise RequestNotFound(
+                    f"request {request_id!r} does not exist",
+                )
+        return request
+
+    page = gate.pending(
+        workflow_id=arguments.workflow,
+        limit=arguments.limit,
+    )
+    if page.swept:
+        print(f"swept {page.swept} overdue request(s)")
+    if not page.requests:
+        print("no pending requests")
+        return None
+
+    print("Pending approvals")
+    for index, request in enumerate(page.requests, start=1):
+        print(
+            f"{index}. {short_reference(request.id)}  "
+            f"{_short_text(request.summary)}",
+        )
+        print(
+            f"   {one_line(request.workflow_id)} | "
+            f"{one_line(request.requested_by)} | "
+            f"expires {format_utc(request.expires_at_ms)}",
+        )
+
+    while True:
+        answer = _ask(
+            input_fn,
+            f"Review which request? [1-{len(page.requests)}, q]: ",
+        )
+        choice = answer.strip().lower()
+        if choice in {"", "q", "quit"}:
+            return None
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Enter a number from the list, or q to quit.")
+            continue
+        if 1 <= index <= len(page.requests):
+            return page.requests[index - 1]
+        print(f"Choose a number from 1 to {len(page.requests)}.")
+
+
+def _review_request(
+    gate: ApprovalGate,
+    request: Request,
+    clock: Clock,
+    input_fn: Callable[[str], str],
+    *,
+    responder: str,
+) -> int:
+    request_id = request.id
+    while True:
+        current = gate.get(request_id)
+        if current is None:
+            raise RequestNotFound(f"request {request_id!r} does not exist")
+        outcome = gate.outcome(request_id)
+
+        if current.status is not Status.PENDING or outcome is not None:
+            _print_receipt(current, outcome)
+            return _EXIT_OK
+        if current.overdue:
+            gate.sweep(request_id=request_id)
+            current = gate.get(request_id)
+            if current is None:
+                raise RequestNotFound(
+                    f"request {request_id!r} does not exist",
+                )
+            _print_receipt(current, gate.outcome(request_id))
+            return _EXIT_OK
+
+        _print_review_card(current, clock)
+        choice = _ask(
+            input_fn,
+            "Decision: [a]pprove [r]eject [s]kip [q]uit [?]details: ",
+        ).strip().lower()
+
+        if choice in {"q", "quit"}:
+            print("review cancelled")
+            return _EXIT_OK
+        if choice in {"s", "skip"}:
+            print("skipped; the request is still pending")
+            return _EXIT_OK
+        if choice in {"?", "d", "details"}:
+            _print_details(current)
+            continue
+        if choice in {"a", "approve"}:
+            if not _confirm(
+                input_fn,
+                f'Approve "{_short_text(current.summary)}"? [y/N] ',
+            ):
+                continue
+            return _apply_review_decision(
+                gate,
+                current,
+                responder=responder,
+                operation="approve",
+                reason=None,
+            )
+        if choice in {"r", "reject"}:
+            while True:
+                reason = _ask(input_fn, "Reason for rejection: ").strip()
+                if reason:
+                    break
+                print("error: a rejection needs a non-empty reason")
+            if not _confirm(
+                input_fn,
+                f'Reject "{_short_text(current.summary)}"? [y/N] ',
+            ):
+                continue
+            return _apply_review_decision(
+                gate,
+                current,
+                responder=responder,
+                operation="reject",
+                reason=reason,
+            )
+        print("Choose a, r, s, q, or ?.")
+
+
+def _apply_review_decision(
+    gate: ApprovalGate,
+    request: Request,
+    *,
+    responder: str,
+    operation: str,
+    reason: str | None,
+) -> int:
+    key = uuid.uuid4().hex
+    try:
+        if operation == "approve":
+            outcome = gate.approve(
+                request.id,
+                responder=responder,
+                expected_digest=request.action_digest,
+                idempotency_key=key,
+                reason=reason,
+            )
+        else:
+            outcome = gate.reject(
+                request.id,
+                responder=responder,
+                expected_digest=request.action_digest,
+                idempotency_key=key,
+                reason=reason,
+            )
+    except ApprovalError as exc:
+        print(f"idempotency_key={key}", file=sys.stderr)
+        return _report_error(exc)
+
+    _print_outcome(outcome, request)
+    return _EXIT_OK
+
+
+def _print_review_card(request: Request, clock: Clock) -> None:
+    print()
+    print(f"Approval {short_reference(request.id)}")
+    print(one_line(request.summary))
+    print(
+        f"Requested by {one_line(request.requested_by)} | "
+        f"workflow {one_line(request.workflow_id)}",
+    )
+    print(f"Created {format_utc(request.created_at_ms)}")
+    print(
+        f"Expires {format_utc(request.expires_at_ms)} "
+        f"({format_remaining(clock.now_ms(), request.expires_at_ms)})",
+    )
+    print()
+    for row in action_rows(request.action):
+        if row.block:
+            print(f"{row.label}:")
+            _print_block(row.value, max_lines=30)
+        else:
+            print(f"{row.label}: {safe_terminal(row.value)}")
+    print()
+    print(f"Payload fingerprint: {digest_fingerprint(request.action_digest)}")
+    print("The agent is waiting and will only resume if approved.")
+    print()
+
+
+def _print_details(request: Request) -> None:
+    print("Technical details")
+    print(f"  request_id: {request.id}")
+    print(f"  action_digest: {request.action_digest}")
+    print(f"  payload_fingerprint: {digest_fingerprint(request.action_digest)}")
+    print(f"  status: {request.status.value}")
+    print(f"  created_at: {format_utc(request.created_at_ms)}")
+    print(f"  expires_at: {format_utc(request.expires_at_ms)}")
+    print(f"  version: {request.version}")
+    print("canonical_json:")
+    for line in canonical_json_text(request).splitlines():
+        print(f"  {safe_terminal(line)}")
+    print()
+
+
+def _print_receipt(request: Request, outcome: Outcome | None) -> None:
+    print()
+    print(f"Approval {short_reference(request.id)}")
+    print(f"  summary: {one_line(request.summary)}")
+    print(f"  status: {request.status.value}")
+    if outcome is None:
+        print("  outcome: not recorded")
+        print()
+        return
+    print(f"  actor: {one_line(outcome.actor or '-')}")
+    if outcome.reason is not None:
+        print(f"  reason: {one_line(outcome.reason)}")
+    print(f"  decided: {format_utc(outcome.at_ms)}")
+    print(f"  request_id: {outcome.request_id}")
+    print(
+        "  payload_fingerprint: "
+        f"{digest_fingerprint(outcome.action_digest)}",
+    )
+    print()
+    if outcome.status is Status.APPROVED:
+        print("The agent may now verify and execute the approved payload.")
+    else:
+        print("The agent will not execute this action.")
+    print()
+
+
+def _print_outcome(outcome: Outcome, request: Request) -> None:
+    suffix = " (replayed)" if outcome.replayed else ""
+    print(f"{outcome.status.value} {outcome.request_id}{suffix}")
+    print(f"  summary: {one_line(request.summary)}")
+    print(f"  actor: {one_line(outcome.actor or '-')}")
+    if outcome.reason is not None:
+        print(f"  reason: {one_line(outcome.reason)}")
+    print(f"  decided: {format_utc(outcome.at_ms)}")
+    if outcome.status is Status.APPROVED:
+        print("The agent may now verify and execute the approved payload.")
+    else:
+        print("The agent will not execute this action.")
+
+
+def _print_block(
+    value: str,
+    *,
+    indent: str = "  ",
+    max_lines: int | None = None,
+) -> None:
+    lines = safe_terminal(value).splitlines() or [""]
+    shown = lines if max_lines is None else lines[:max_lines]
+    for line in shown:
+        print(f"{indent}{line}")
+    if max_lines is not None and len(lines) > max_lines:
+        remaining = len(lines) - max_lines
+        print(f"{indent}... {remaining} more line(s); choose ? for details")
+
+
+def _ask(input_fn: Callable[[str], str], prompt: str) -> str:
+    try:
+        return input_fn(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise _ReviewCancelled from None
+
+
+def _confirm(input_fn: Callable[[str], str], prompt: str) -> bool:
+    return _ask(input_fn, prompt).strip().lower() in {"y", "yes"}
+
+
+def _short_text(text: str, limit: int = 80) -> str:
+    printable = one_line(text)
+    if len(printable) <= limit:
+        return printable
+    return f"{printable[: limit - 1]}..."
 
 
 def _decide(

@@ -2,7 +2,7 @@
 
 Status: Implemented (V1)  
 Scope: V1  
-Last updated: 2026-10-29
+Last updated: 2026-10-30
 
 ## Contents
 
@@ -42,14 +42,14 @@ The gate guarantees a single durable decision and idempotent retries of that dec
 - Correct behavior under concurrent responders and multiple processes.
 - Deterministic tests with no real sleeps or wall-clock reads.
 - No runtime dependencies in the core.
-- Thin CLI and FastAPI adapters for the human side.
+- A terminal Approval Console, a thin CLI, an agent-side bridge, and FastAPI adapters for the two sides of the flow.
 - Fail-closed expiry: a request that times out is never approved.
 - TOCTOU protection: an approval is bound to the exact action payload the human saw.
 
 ### Non-goals for V1
 
 - Multi-approver policies, quorum, or escalation chains.
-- Production-grade authentication, authorization, identity integration, a web UI, or notifications.
+- Production-grade authentication, authorization, identity integration, a web UI, notifications, always-allow rules, or batch approval.
 - Automatic approval on timeout.
 - Exactly-once execution of the approved side effect.
 - A policy DSL, multi-tenancy, or a hosted service.
@@ -78,7 +78,8 @@ Those are extension points, not forgotten requirements. See [Evolution](#14-evol
 | Audit integrity | Append-only triggers plus immutable request fields |
 | Core dependencies | None (standard library only) |
 | Waiting | Polling with separate sync/async sleepers; blocking store work offloaded |
-| Human interfaces | Thin CLI and FastAPI demo |
+| Human interfaces | Terminal Approval Console, thin CLI, and FastAPI demo |
+| Agent integration | Non-blocking propose/status/wait bridge; execution stays caller-owned |
 
 ## 4. Domain model
 
@@ -942,6 +943,8 @@ Terminal errors carry the current outcome so adapters can return a useful 409/41
 ```text
 approval-gate --db approvals.db list [--workflow ID] [--limit N]
 approval-gate --db approvals.db show ID
+approval-gate --db approvals.db review [ID] --responder alice
+    [--workflow ID] [--limit N]
 approval-gate --db approvals.db approve ID --responder alice --digest HEX
     [--reason TEXT] [--idempotency-key KEY]
 approval-gate --db approvals.db reject ID --responder bob --digest HEX
@@ -953,7 +956,8 @@ approval-gate --db approvals.db sweep
 
 - `list` calls `pending()` and therefore sweeps, then prints the page’s requests. This is documented in `--help`.
 - `show` uses the pure `get()`.
-- Approve/reject require the full digest. A digest prefix is rejected.
+- `review` is an interactive one-request view. It requires a TTY, renders the action card, and handles the digest behind the decision. It is a convenience surface, not an authorization boundary.
+- Approve/reject require the full digest. A digest prefix is rejected. These commands remain the non-interactive automation path.
 - Reject requires a reason at the CLI layer.
 - If `--idempotency-key` is omitted, the CLI generates one and prints it before applying, so a failed invocation can be retried with the same key.
 
@@ -968,7 +972,50 @@ Suggested exit codes:
 | 5 | Digest mismatch |
 | 6 | Invalid input |
 
-### 11.2 HTTP demo
+### 11.2 Approval Console and agent bridge
+
+The terminal Approval Console is the human surface used for dogfooding. It lives in `examples/approval_console.py`; it is an example adapter, not part of the installed wheel, but it uses only the public facade plus the shared presentation helpers.
+
+```text
+python examples/approval_console.py --db approvals.db --as alice@corp
+    [--workflow ID] [--limit N]
+
+approval> pending
+approval> show [N|ID]
+approval> approve [N|ID]
+approval> reject [N|ID] REASON
+approval> details [N|ID]
+approval> quit
+```
+
+- `pending` calls `pending()` and therefore sweeps. It lists only unexpired pending requests.
+- A numeric target is resolved against the page just rendered. A request ID is read with the pure `get()`.
+- The card renders `action_rows(request.action)` plus a short digest fingerprint. Known fields such as tool, command, branch, recipient, and message get human labels; unknown fields remain visible in an `Other fields` block. The canonical JSON and full digest are available through `details`.
+- Approve and reject confirm first. The console binds `expected_digest` to the request it rendered and generates a fresh idempotency key for the decision. The human never types either value.
+- Reject requires a non-empty reason. The console asks again if the reason is blank.
+- A direct `show` of an overdue request records the targeted expiry and prints the receipt; it does not present an expired action as approvable.
+- A terminal request shows its receipt instead of an approval card. This includes decisions made by another surface.
+- `--as` is an identity assertion, not authentication. The console has no authority of its own; the gate records the asserted identity in the transition.
+- Untrusted summary, actor, workflow, and reason fields are rendered on one line. Payload blocks are indented and control characters are escaped, so stored text cannot drive the terminal.
+
+The agent bridge is `examples/agent_cli.py`:
+
+```text
+python examples/agent_cli.py --db approvals.db propose --workflow ID
+    --summary TEXT (--action JSON | --action-file PATH) [--ttl-seconds N]
+    [--requested-by ID] [--dedupe-key KEY] [--json]
+python examples/agent_cli.py --db approvals.db status ID [--json]
+python examples/agent_cli.py --db approvals.db wait ID
+    [--timeout N] [--poll-interval N] [--json]
+```
+
+`propose` creates a durable request and exits immediately, so the agent can end its turn. `status` is a pure read; when the request is approved it calls `verified_action()` and prints the verified canonical payload. `wait` is an opt-in polling convenience. The bridge never executes the action and never treats a pending request as permission to continue.
+
+Exit codes are `0` approved/proposed, `1` internal error, `2` not found, `3` rejected, `4` expired, `5` cancelled, `6` still pending, and `7` invalid input.
+
+The bridge is a coordination tool, not a sandbox. An agent that can run arbitrary commands can bypass it unless the tool loop or execution environment enforces the gate.
+
+### 11.3 HTTP demo
 
 The FastAPI app is a demonstration adapter, not a production service.
 
@@ -1023,12 +1070,12 @@ Error envelope:
 }
 ```
 
-### 11.3 Authentication and trust
+### 11.4 Authentication and trust
 
 The core treats `requested_by`, `responder`, and `actor` as opaque strings. It does not authenticate them.
 
 - The FastAPI demo uses static bearer tokens mapped to identities. This is an illustrative adapter, not a production auth system.
-- The CLI treats `--responder` and `--actor` as caller-supplied identity assertions, not authentication.
+- The CLI treats `--responder` and `--actor`, and the Approval Console treats `--as`, as caller-supplied identity assertions, not authentication.
 - Production adapters must authenticate the human and derive `requested_by`, `responder`, and `actor` from that identity.
 - The approval digest is part of the authorization decision: the human approves the digest they saw, and the server refuses to apply it to a different payload.
 
@@ -1141,6 +1188,8 @@ The same suite runs against the memory and SQLite stores:
 **Adapter tests**
 
 - CLI exit codes and digest requirement.
+- Interactive `review` and the example Approval Console: list, show, approve/reject confirmation, details, expiry receipts, terminal requests, invalid targets, workflow filtering, and terminal-control escaping.
+- Agent bridge propose/status/wait output, JSON mode, payload verification, and exit codes.
 - HTTP status mapping, missing idempotency key, self-approval denial, and replay body.
 - `list` in the CLI performs a sweep; `show` does not.
 
@@ -1179,7 +1228,7 @@ Using Hypothesis, generate sequences of propose/approve/reject/cancel/sweep/adva
 - Action immutability, canonical-byte verification, and trigger-enforcement tests pass.
 - The async wait test proves the event loop is not blocked.
 - No unit test uses real sleeps or the wall clock.
-- CLI and FastAPI demos run against a temporary database.
+- CLI, Approval Console, agent bridge, and FastAPI demos run against a temporary database.
 - The public API and schema are documented.
 
 ## 13. Failure modes
@@ -1246,6 +1295,7 @@ src/approval_gate/
     gate.py            # facade, wait loops, async offload
     clock.py           # Clock, ManualClock, IdGenerator, sync/async sleepers
     errors.py
+    presentation.py    # action cards, fingerprints, timestamps, terminal escaping
     stores/
         base.py        # Store protocol and contract test helpers
         memory.py      # tests and examples
@@ -1253,8 +1303,10 @@ src/approval_gate/
         schema.sql     # tables, indexes, and triggers
     cli.py
 examples/
-    fastapi_app.py
-    agent_tool.py
+    fastapi_app.py       # bearer-token HTTP demo
+    agent_tool.py        # propose -> wait -> verify -> execute
+    approval_console.py  # terminal human approval console
+    agent_cli.py         # non-blocking agent bridge
 tests/
     test_state.py
     test_idempotency.py
@@ -1265,6 +1317,9 @@ tests/
     test_wait.py
     test_async_wait.py
     test_cli.py
+    test_presentation.py
+    test_agent_cli.py
+    test_approval_console.py
     test_http.py
 docs/
     design.md
@@ -1282,7 +1337,7 @@ The core package requires Python 3.11+ and has no runtime dependencies. FastAPI,
 
 **M3 — Facade and waiting.** `propose`, `get`, `list`, `outcome`, `pending`, `sweep`, `approve`, `reject`, `cancel`, `verified_action`, sync/async wait, and facade tests.
 
-**M4 — Adapters.** CLI and FastAPI demo, plus an agent-tool example that proposes, waits, obtains a `VerifiedAction`, and executes the exact returned payload.
+**M4 — Adapters.** CLI, FastAPI demo, terminal Approval Console, and an agent-side bridge. The agent examples propose, wait, obtain a `VerifiedAction`, and execute only the exact returned payload.
 
 **M5 — Packaging.** `pyproject.toml`, README usage, and a runnable demo.
 
@@ -1320,12 +1375,16 @@ Exit criteria for M2/M3:
 | D16 | Database triggers enforce audit and transition integrity | Defense in depth, not just application convention |
 | D17 | Sync and async wait use separate sleeper protocols | No blocking sleep or synchronous DB work on the event loop |
 | D18 | Demo auth is explicitly illustrative | Keeps the non-goal honest without weakening the example |
+| D19 | The terminal Approval Console is the primary human surface | Readable approval cards and confirmations fit human-paced review; no browser or extra runtime is required |
+| D20 | The agent bridge is non-blocking by default | A coding agent can propose and end its turn; `status`/`wait` are explicit resume points, not a held connection |
+| D21 | The console binds the digest behind the decision | Humans review the payload, not a 64-character token, while the gate still verifies exact bytes |
 
 ## 18. Deferred
 
 - Multi-approver policies, quorum, delegation, and escalation.
 - A core authorization hook or policy language.
 - A web UI, notification delivery, and a transactional outbox.
+- Always-allow rules, batch approval, and editing a proposed payload inside the approval surface.
 - Exactly-once execution claims and a `claim()` API.
 - PostgreSQL and other store backends.
 - Pub/sub, webhooks, SSE, and long-poll waiting.
