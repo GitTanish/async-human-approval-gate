@@ -731,6 +731,39 @@ def test_review_requires_a_terminal(
     assert "interactive terminal" in capsys.readouterr().err
 
 
+def test_review_detects_an_interactive_terminal_by_default(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = cli.propose()
+    answers = iter(["a", "y"])
+    monkeypatch.setattr(
+        "sys.stdin",
+        type("FakeStdin", (), {"isatty": lambda self: True})(),
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    assert cli.run("review", request.id, "--responder", "alice@corp") == 0
+
+    assert cli.gate.get(request.id).status is Status.APPROVED
+    assert "approved" in capsys.readouterr().out
+
+
+def test_review_refuses_when_stdin_is_not_a_tty_by_default(
+    cli: CliEnv,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.stdin",
+        type("FakeStdin", (), {"isatty": lambda self: False})(),
+    )
+
+    assert cli.run("review", "--responder", "alice@corp") == 6
+    assert "interactive terminal" in capsys.readouterr().err
+
+
 def test_review_direct_id_sweeps_and_shows_expiry(
     cli: CliEnv,
     capsys: pytest.CaptureFixture[str],

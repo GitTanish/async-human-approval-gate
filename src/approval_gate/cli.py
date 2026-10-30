@@ -202,7 +202,10 @@ def main(
         print(f"swept {gate.sweep()}")
         return _EXIT_OK
     if arguments.command == "review":
-        interactive = input_fn is not None if tty is None else tty
+        if tty is None:
+            interactive = input_fn is not None or _stdin_is_tty()
+        else:
+            interactive = tty
         return _review(
             gate,
             arguments,
@@ -236,6 +239,13 @@ def main(
         )
     parser.error(f"unknown command: {arguments.command}")
     return _EXIT_INVALID
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, OSError):
+        return False
 
 
 def _build_gate(db_path: str, *, clock: Clock | None = None) -> ApprovalGate:

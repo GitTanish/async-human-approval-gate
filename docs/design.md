@@ -981,15 +981,15 @@ python examples/approval_console.py --db approvals.db --as alice@corp
     [--workflow ID] [--limit N]
 
 approval> pending
-approval> show [N|ID]
-approval> approve [N|ID]
-approval> reject [N|ID] REASON
-approval> details [N|ID]
+approval> show [N|ID|#REF]
+approval> approve [N|ID|#REF]
+approval> reject [N|ID|#REF] REASON
+approval> details [N|ID|#REF]
 approval> quit
 ```
 
 - `pending` calls `pending()` and therefore sweeps. It lists only unexpired pending requests.
-- A numeric target is resolved against the page just rendered. A request ID is read with the pure `get()`.
+- A numeric target is resolved against the page just rendered. A short `#REF` target is resolved by prefix against the pending page. A full request ID is read with the pure `get()`.
 - The card renders `action_rows(request.action)` plus a short digest fingerprint. Known fields such as tool, command, branch, recipient, and message get human labels; unknown fields remain visible in an `Other fields` block. The canonical JSON and full digest are available through `details`.
 - Approve and reject confirm first. The console binds `expected_digest` to the request it rendered and generates a fresh idempotency key for the decision. The human never types either value.
 - Reject requires a non-empty reason. The console asks again if the reason is blank.
