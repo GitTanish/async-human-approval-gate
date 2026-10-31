@@ -4,6 +4,8 @@ A small Python component that pauses an agent workflow until a human approves or
 
 The core is dependency-free and uses only the Python standard library. SQLite provides durable storage and real transactions. A terminal Approval Console, a thin CLI, an agent-side bridge, and a FastAPI demo show the two sides of the flow.
 
+![Approval flow: the agent proposes an action to the Approval Gate; a human approves or rejects it; the gate records the decision in SQLite and returns the outcome to the agent, which verifies and executes the payload](docs/assets/approval-flow.png)
+
 - Design: [docs/design.md](docs/design.md)
 - Python: 3.11+
 - Runtime dependencies: none
